@@ -103,11 +103,11 @@ export function Dashboard() {
           (1000 * 60 * 60 * 24),
       )
     : 0;
+  const dailySavings = daysOwned > 0 ? stats.totalSaved / daysOwned : 0;
+
   const breakEvenDays =
-    selectedCar && stats.totalSaved > 0
-      ? Math.ceil(
-          (Number(selectedCar.purchase_price) / stats.totalSaved) * daysOwned,
-        )
+    selectedCar && dailySavings > 0
+      ? Math.ceil(Number(selectedCar.purchase_price) / dailySavings)
       : 0;
 
   if (loading) {
