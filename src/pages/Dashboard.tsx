@@ -6,7 +6,6 @@ import {
   Calendar,
   Battery,
   Zap,
-  MapPin,
   ChevronDown,
 } from "lucide-react";
 import { Navigation } from "../components/Navigation";
@@ -20,6 +19,7 @@ export function Dashboard() {
   const [cars, setCars] = useState<EVCar[]>([]);
   const [selectedCar, setSelectedCar] = useState<EVCar | null>(null);
   const [energyData, setEnergyData] = useState<EnergyUsage[]>([]);
+  const [recentActivity, setRecentActivity] = useState<EnergyUsage[]>([]);
   const [loading, setLoading] = useState(true);
   const [isCarDropdownOpen, setIsCarDropdownOpen] = useState(false);
 
@@ -36,7 +36,7 @@ export function Dashboard() {
   }, [selectedCar]);
 
   const loadCars = async () => {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("ev_cars")
       .select("*")
       .eq("user_id", user!.id)
@@ -53,15 +53,17 @@ export function Dashboard() {
   const loadEnergyData = async () => {
     if (!selectedCar) return;
 
-    const { data } = await supabase
+    // Fetch ALL records for accurate stats and breakeven calculation
+    const { data: allData } = await supabase
       .from("energy_usage")
       .select("*")
       .eq("car_id", selectedCar.id)
-      .order("recorded_at", { ascending: false })
-      .limit(30);
+      .order("recorded_at", { ascending: false });
 
-    if (data) {
-      setEnergyData(data);
+    if (allData) {
+      setEnergyData(allData);
+      // Keep only the 8 most recent for the activity feed
+      setRecentActivity(allData.slice(0, 8));
     }
   };
 
@@ -73,7 +75,8 @@ export function Dashboard() {
 
     await supabase.from("ev_cars").update({ is_active: true }).eq("id", car.id);
 
-    setSelectedCar(car);
+    setSelectedCar({ ...car, is_active: true });
+    setCars((prev) => prev.map((c) => ({ ...c, is_active: c.id === car.id })));
     setIsCarDropdownOpen(false);
   };
 
@@ -97,18 +100,48 @@ export function Dashboard() {
   };
 
   const treesEquivalent = Math.floor(stats.totalCO2 / 20);
+
   const daysOwned = selectedCar
-    ? Math.floor(
-        (new Date().getTime() - new Date(selectedCar.purchase_date).getTime()) /
-          (1000 * 60 * 60 * 24),
+    ? Math.max(
+        1,
+        Math.floor(
+          (new Date().getTime() -
+            new Date(selectedCar.purchase_date).getTime()) /
+            (1000 * 60 * 60 * 24),
+        ),
       )
-    : 0;
-  const dailySavings = daysOwned > 0 ? stats.totalSaved / daysOwned : 0;
+    : 1;
+
+  // Use the actual span of recorded data to compute daily savings rate,
+  // falling back to daysOwned if there's only one or zero records.
+  const dataSpanDays =
+    energyData.length > 1
+      ? Math.max(
+          1,
+          Math.floor(
+            (new Date(energyData[0].recorded_at).getTime() -
+              new Date(
+                energyData[energyData.length - 1].recorded_at,
+              ).getTime()) /
+              (1000 * 60 * 60 * 24),
+          ),
+        )
+      : daysOwned;
+
+  const dailySavings = dataSpanDays > 0 ? stats.totalSaved / dataSpanDays : 0;
 
   const breakEvenDays =
     selectedCar && dailySavings > 0
       ? Math.ceil(Number(selectedCar.purchase_price) / dailySavings)
       : 0;
+
+  const alreadyBrokenEven = breakEvenDays > 0 && breakEvenDays <= daysOwned;
+  const daysRemaining =
+    breakEvenDays > daysOwned ? breakEvenDays - daysOwned : 0;
+
+  // Progress toward breakeven as a percentage (capped at 100)
+  const breakevenProgress =
+    breakEvenDays > 0 ? Math.min(100, (daysOwned / breakEvenDays) * 100) : 0;
 
   if (loading) {
     return (
@@ -151,6 +184,7 @@ export function Dashboard() {
       <Navigation />
 
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+        {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-6 mb-12">
           <div>
             <h1 className="text-4xl font-bold text-gray-900 mb-2">Dashboard</h1>
@@ -159,6 +193,7 @@ export function Dashboard() {
             </p>
           </div>
 
+          {/* Car selector */}
           <div className="relative w-full sm:w-80">
             <button
               onClick={() => setIsCarDropdownOpen(!isCarDropdownOpen)}
@@ -224,6 +259,7 @@ export function Dashboard() {
           </div>
         </div>
 
+        {/* Stat cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
           <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-200 hover:shadow-md transition-shadow">
             <div className="flex items-center justify-between mb-4">
@@ -274,6 +310,7 @@ export function Dashboard() {
           </div>
         </div>
 
+        {/* Environmental impact + Breakeven */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-12">
           <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
             <h2 className="text-2xl font-bold text-gray-900 mb-8 flex items-center gap-2">
@@ -297,37 +334,41 @@ export function Dashboard() {
 
                 <div className="relative h-96 bg-white rounded-lg p-4 overflow-hidden border border-green-100">
                   <div className="flex flex-wrap gap-3 justify-center items-end h-full content-end">
-                    {Array.from({ length: Math.min(treesEquivalent, 40) }).map(
-                      (_, i) => (
-                        <div
-                          key={i}
-                          className="flex flex-col items-center animate-in fade-in duration-500"
-                          style={{
-                            animationDelay: `${i * 50}ms`,
-                          }}
+                    {Array.from({
+                      length: Math.min(treesEquivalent, 40),
+                    }).map((_, i) => (
+                      <div
+                        key={i}
+                        className="flex flex-col items-center animate-in fade-in duration-500"
+                        style={{ animationDelay: `${i * 50}ms` }}
+                      >
+                        <svg
+                          className="w-8 h-12 text-green-600 drop-shadow"
+                          viewBox="0 0 24 32"
+                          fill="currentColor"
                         >
-                          <svg
-                            className="w-8 h-12 text-green-600 drop-shadow"
-                            viewBox="0 0 24 32"
-                            fill="currentColor"
-                          >
-                            <path d="M12 2 L8 10 L2 10 L8 14 L5 24 L12 18 L19 24 L16 14 L22 10 L16 10 Z" />
-                            <rect
-                              x="11"
-                              y="20"
-                              width="2"
-                              height="12"
-                              fill="#8B6F47"
-                            />
-                          </svg>
-                        </div>
-                      ),
-                    )}
+                          <path d="M12 2 L8 10 L2 10 L8 14 L5 24 L12 18 L19 24 L16 14 L22 10 L16 10 Z" />
+                          <rect
+                            x="11"
+                            y="20"
+                            width="2"
+                            height="12"
+                            fill="#8B6F47"
+                          />
+                        </svg>
+                      </div>
+                    ))}
 
                     {treesEquivalent > 40 && (
                       <div className="absolute bottom-4 right-4 bg-green-600 text-white px-4 py-2 rounded-lg font-semibold">
                         +{treesEquivalent - 40} more
                       </div>
+                    )}
+
+                    {treesEquivalent === 0 && (
+                      <p className="text-gray-400 text-sm pb-4">
+                        Start driving to see your impact!
+                      </p>
                     )}
                   </div>
                 </div>
@@ -354,9 +395,11 @@ export function Dashboard() {
                       Impact
                     </div>
                     <div className="text-xl font-bold text-green-600">
-                      {Math.round(
-                        (stats.totalCO2 / stats.totalDistance) * 100,
-                      ) || 0}
+                      {stats.totalDistance > 0
+                        ? Math.round(
+                            (stats.totalCO2 / stats.totalDistance) * 100,
+                          )
+                        : 0}
                       g/km
                     </div>
                   </div>
@@ -384,6 +427,7 @@ export function Dashboard() {
             </div>
           </div>
 
+          {/* Breakeven card */}
           <div className="bg-gradient-to-br from-green-600 to-emerald-700 rounded-2xl shadow-lg p-8 text-white h-fit">
             <h3 className="text-2xl font-bold mb-6 flex items-center gap-2">
               <Calendar className="h-6 w-6" />
@@ -404,9 +448,20 @@ export function Dashboard() {
               </div>
 
               <div className="bg-white bg-opacity-10 rounded-lg p-4 backdrop-blur">
-                <div className="text-sm text-green-100 mb-2">Already Saved</div>
+                <div className="text-sm text-green-100 mb-2">
+                  Total Saved (all time)
+                </div>
                 <div className="text-3xl font-bold">
                   ${stats.totalSaved.toFixed(2)}
+                </div>
+              </div>
+
+              <div className="bg-white bg-opacity-10 rounded-lg p-4 backdrop-blur">
+                <div className="text-sm text-green-100 mb-2">
+                  Avg Daily Savings
+                </div>
+                <div className="text-3xl font-bold">
+                  ${dailySavings.toFixed(2)}
                 </div>
               </div>
 
@@ -415,23 +470,45 @@ export function Dashboard() {
                 <div className="text-3xl font-bold">{daysOwned}</div>
               </div>
 
+              {/* Progress bar */}
+              {breakEvenDays > 0 && (
+                <div className="bg-white bg-opacity-10 rounded-lg p-4 backdrop-blur">
+                  <div className="flex justify-between text-sm text-green-100 mb-2">
+                    <span>Breakeven Progress</span>
+                    <span>{breakevenProgress.toFixed(1)}%</span>
+                  </div>
+                  <div className="w-full bg-white bg-opacity-20 rounded-full h-3">
+                    <div
+                      className="bg-white h-3 rounded-full transition-all duration-500"
+                      style={{ width: `${breakevenProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
               <div className="border-t border-white border-opacity-20 pt-6">
                 <div className="text-sm text-green-100 mb-2">
                   Estimated Breakeven
                 </div>
                 <div className="text-4xl font-bold mb-2">
                   {breakEvenDays > 0
-                    ? `${breakEvenDays} days`
+                    ? `${breakEvenDays.toLocaleString()} days`
                     : "Calculating..."}
                 </div>
-                {breakEvenDays > daysOwned && (
-                  <div className="text-sm text-green-100">
-                    {breakEvenDays - daysOwned} days remaining
+                {alreadyBrokenEven && (
+                  <div className="text-sm text-green-200 font-semibold">
+                    🎉 Already broken even!
                   </div>
                 )}
-                {breakEvenDays <= daysOwned && breakEvenDays > 0 && (
-                  <div className="text-sm text-green-200 font-semibold">
-                    Already broken even!
+                {!alreadyBrokenEven && daysRemaining > 0 && (
+                  <div className="text-sm text-green-100">
+                    {daysRemaining.toLocaleString()} days remaining (~{" "}
+                    {Math.ceil(daysRemaining / 365)} years)
+                  </div>
+                )}
+                {breakEvenDays === 0 && (
+                  <div className="text-sm text-green-200">
+                    Add more trips to calculate
                   </div>
                 )}
               </div>
@@ -439,13 +516,14 @@ export function Dashboard() {
           </div>
         </div>
 
+        {/* Recent activity + Vehicle info */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-12">
           <div className="lg:col-span-2 bg-white p-8 rounded-2xl shadow-sm border border-gray-200">
             <h3 className="text-2xl font-bold text-gray-900 mb-6">
               Recent Activity
             </h3>
 
-            {energyData.length === 0 ? (
+            {recentActivity.length === 0 ? (
               <div className="text-center py-12">
                 <Battery className="h-12 w-12 text-gray-300 mx-auto mb-3" />
                 <p className="text-gray-600 text-lg">
@@ -454,7 +532,7 @@ export function Dashboard() {
               </div>
             ) : (
               <div className="space-y-3">
-                {energyData.slice(0, 8).map((entry, idx) => (
+                {recentActivity.map((entry, idx) => (
                   <div
                     key={entry.id}
                     className={`flex justify-between items-center p-4 rounded-lg border transition-colors ${
@@ -517,7 +595,9 @@ export function Dashboard() {
                     <div className="flex-1 bg-gray-200 rounded-full h-2">
                       <div
                         className="bg-gradient-to-r from-green-600 to-green-500 h-2 rounded-full"
-                        style={{ width: `${selectedCar.current_charge}%` }}
+                        style={{
+                          width: `${Number(selectedCar.current_charge)}%`,
+                        }}
                       />
                     </div>
                     <div className="text-xl font-bold text-gray-900">
@@ -548,6 +628,15 @@ export function Dashboard() {
                         year: "numeric",
                       },
                     )}
+                  </div>
+                </div>
+
+                <div className="p-4 bg-gray-50 rounded-lg border border-gray-200">
+                  <div className="text-xs text-gray-600 font-medium mb-2">
+                    Total Trips Recorded
+                  </div>
+                  <div className="text-2xl font-bold text-gray-900">
+                    {energyData.length}
                   </div>
                 </div>
               </div>
